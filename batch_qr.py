@@ -82,13 +82,17 @@ def resolve_font(family: str) -> Path:
     return path
 
 
-def render_text(text: str, font: ImageFont.FreeTypeFont, color: str) -> Image.Image:
-    """ドットフォントをアンチエイリアスなしで描く。"""
-    mask_core, _offset = font.getmask2(text, mode="1")
+def render_glyph(
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    color: str,
+) -> tuple[Image.Image, tuple[int, int]]:
+    """ドットフォントをアンチエイリアスなしで描き、配置オフセットも返す。"""
+    mask_core, offset = font.getmask2(text, mode="1")
     mask = Image.new("L", (1, 1))._new(mask_core).convert("L")
     mask = mask.point(lambda value: 255 if value >= 128 else 0)
     red, green, blue = ImageColor.getrgb(color)
-    return Image.merge(
+    image = Image.merge(
         "RGBA",
         (
             Image.new("L", mask.size, red),
@@ -97,6 +101,64 @@ def render_text(text: str, font: ImageFont.FreeTypeFont, color: str) -> Image.Im
             mask,
         ),
     )
+    return image, offset
+
+
+def wrap_lines(text: str, font: ImageFont.FreeTypeFont, inner_width: int) -> list[str]:
+    """文字単位で inner_width 以内に折り返す。"""
+    lines: list[str] = []
+    current = ""
+    for char in text:
+        trial = current + char
+        if current and font.getlength(trial) > inner_width:
+            lines.append(current)
+            current = char
+        else:
+            current = trial
+    if current:
+        lines.append(current)
+    return lines
+
+
+def make_url_bar(
+    url: str,
+    font: ImageFont.FreeTypeFont,
+    max_width: int,
+    align: str,
+) -> Image.Image:
+    """URL 帯を作る。折り返したときは空きも背景色で塗る。
+
+    1行に収まるときは文字幅の帯にする。折り返したときは max_width の帯にし、
+    align が left なら左、right なら右へ文字を寄せる。
+    """
+    if align not in {"left", "right"}:
+        raise ValueError(f"配置は left か right です: {align}")
+    inner_width = max_width - config.URL_PADDING_X * 2
+    if inner_width <= 0:
+        raise ValueError(
+            f"折り返し幅が左右の余白以下です: {max_width}px"
+        )
+
+    lines = wrap_lines(url, font, inner_width)
+    glyphs = [render_glyph(line, font, config.URL_TEXT_COLOR) for line in lines]
+    if len(glyphs) == 1:
+        bar_width = glyphs[0][0].width + config.URL_PADDING_X * 2
+    else:
+        bar_width = max_width
+
+    bar_height = config.URL_BAR_HEIGHT * len(glyphs)
+    background = ImageColor.getrgb(config.URL_BG_COLOR) + (255,)
+    bar = Image.new("RGBA", (bar_width, bar_height), background)
+    ascent, descent = font.getmetrics()
+    em_top = (config.URL_BAR_HEIGHT - (ascent + descent)) // 2
+    for index, (glyph, offset) in enumerate(glyphs):
+        if align == "right":
+            x = bar_width - config.URL_PADDING_X - glyph.width + offset[0]
+        else:
+            x = config.URL_PADDING_X + offset[0]
+        y = index * config.URL_BAR_HEIGHT + em_top + offset[1]
+        paste_clipped(bar, glyph, x, y)
+    return bar
 
 
 def make_qr(url: str) -> Image.Image:
@@ -147,93 +209,42 @@ def paste_clipped(
 def compose(
     source: Image.Image,
     url: str,
-    side: str,
     font: ImageFont.FreeTypeFont,
 ) -> Image.Image:
-    """URL 帯を左下または右下へ、QR を元画像の右下へ上書きする。
+    """URL 帯を下端へ、QR を元画像の右下へ載せる。
 
-    帯が画像幅を超えるときだけ、はみ出した側を透明にして広げる。
-    QR は left / right に関わらず元画像の右端に置き、拡張した余白には出さない。
+    文字は画像の幅で折り返す。1行なら帯は文字幅で左下に置く。
+    折り返したときは帯を画像幅にし、文字のない部分も背景色で塗る。
     """
     src = source.convert("RGBA")
-    text = render_text(url, font, config.URL_TEXT_COLOR)
-    bar_width = text.width + config.URL_PADDING_X * 2
-    bar_height = config.URL_BAR_HEIGHT
+    bar = make_url_bar(url, font, src.width, "left")
     qr_image = make_qr(url)
 
-    if bar_width > src.width:
-        canvas = Image.new("RGBA", (bar_width, src.height), (0, 0, 0, 0))
-        image_x = 0 if side == "left" else bar_width - src.width
-        canvas.paste(src, (image_x, 0), src)
-    else:
-        canvas = src.copy()
-        image_x = 0
-
-    if side == "left":
-        bar_x = 0
-    else:
-        bar_x = canvas.width - bar_width
-
-    bar_y = canvas.height - bar_height
-    qr_x = image_x + src.width - qr_image.width
+    bar_y = src.height - bar.height
     qr_y = bar_y - qr_image.height
-
-    paste_clipped(canvas, qr_image, qr_x, qr_y)
-    bar = Image.new("RGBA", (bar_width, bar_height), ImageColor.getrgb(config.URL_BG_COLOR) + (255,))
-    canvas.paste(bar, (bar_x, bar_y))
-    text_x = bar_x + config.URL_PADDING_X
-    text_y = bar_y + (bar_height - text.height) // 2
-    paste_clipped(
-        canvas,
-        text,
-        text_x,
-        text_y,
-        (bar_x, bar_y, bar_x + bar_width, bar_y + bar_height),
-    )
+    origin_y = min(0, bar_y, qr_y)
+    canvas = Image.new("RGBA", (src.width, src.height - origin_y), (0, 0, 0, 0))
+    canvas.paste(src, (0, -origin_y), src)
+    paste_clipped(canvas, qr_image, src.width - qr_image.width, qr_y - origin_y)
+    canvas.paste(bar, (0, bar_y - origin_y), bar)
     return canvas
 
 
-def compose_plain(
-    url: str,
-    side: str,
-    font: ImageFont.FreeTypeFont,
-) -> Image.Image:
-    """元画像なしで URL 帯と QR を描く。
+def compose_plain(url: str, font: ImageFont.FreeTypeFont) -> Image.Image:
+    """元画像なしで、URL 帯を QR の左隣かつ下端揃えで置く。
 
-    left は両方を左へ、right は両方を右へ寄せる。
-    幅の差で空いた部分は透明のままにする。
+    文字は URL_WRAP_WIDTH から QR の幅を引いた残りで折り返し、左に寄せる。
+    折り返すと、帯と QR を合わせた幅が URL_WRAP_WIDTH になる。
+    帯と QR のどちらにも掛からない部分は透明のままにする。
+    折り返した行の、文字がない部分は背景色で塗る。
     """
-    text = render_text(url, font, config.URL_TEXT_COLOR)
-    bar_width = text.width + config.URL_PADDING_X * 2
-    bar_height = config.URL_BAR_HEIGHT
     qr_image = make_qr(url)
-
-    width = max(bar_width, qr_image.width)
-    height = qr_image.height + bar_height
+    bar = make_url_bar(url, font, config.URL_WRAP_WIDTH - qr_image.width, "left")
+    width = bar.width + qr_image.width
+    height = max(bar.height, qr_image.height)
     canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-
-    if side == "left":
-        bar_x = 0
-        qr_x = 0
-    else:
-        bar_x = width - bar_width
-        qr_x = width - qr_image.width
-
-    bar_y = height - bar_height
-    qr_y = 0
-
-    paste_clipped(canvas, qr_image, qr_x, qr_y)
-    bar = Image.new("RGBA", (bar_width, bar_height), ImageColor.getrgb(config.URL_BG_COLOR) + (255,))
-    canvas.paste(bar, (bar_x, bar_y))
-    text_x = bar_x + config.URL_PADDING_X
-    text_y = bar_y + (bar_height - text.height) // 2
-    paste_clipped(
-        canvas,
-        text,
-        text_x,
-        text_y,
-        (bar_x, bar_y, bar_x + bar_width, bar_y + bar_height),
-    )
+    paste_clipped(canvas, qr_image, bar.width, height - qr_image.height)
+    canvas.paste(bar, (0, height - bar.height), bar)
     return canvas
 
 
@@ -260,14 +271,14 @@ def process_row(
     dist_dir: Path,
 ) -> bool:
     """1行を処理する。成功かスキップなら True、失敗なら False。"""
-    if len(row) != 4:
+    if len(row) != 3:
         print(
-            f"行 {line_no}: 列は画像の有無,名前,URL,配置の4つです",
+            f"行 {line_no}: 列は画像の有無,名前,URLの3つです",
             file=sys.stderr,
         )
         return False
 
-    has_image_text, filename, url, side = (cell.strip() for cell in row)
+    has_image_text, filename, url = (cell.strip() for cell in row)
     has_image_key = has_image_text.lower()
     if has_image_key not in {"true", "false"}:
         print(
@@ -281,9 +292,6 @@ def process_row(
         return False
     if not url:
         print(f"行 {line_no}: URLが空です", file=sys.stderr)
-        return False
-    if side not in {"left", "right"}:
-        print(f"行 {line_no}: 配置は left か right です: {side}", file=sys.stderr)
         return False
 
     if not has_image and not Path(filename).suffix:
@@ -300,9 +308,9 @@ def process_row(
             print(f"行 {line_no}: 画像がありません: {source_path}", file=sys.stderr)
             return False
         with Image.open(source_path) as source:
-            result = compose(source, url, side, font)
+            result = compose(source, url, font)
     else:
-        result = compose_plain(url, side, font)
+        result = compose_plain(url, font)
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     result.save(dest_path, "PNG")
