@@ -147,9 +147,10 @@ def compose(
     side: str,
     font: ImageFont.FreeTypeFont,
 ) -> Image.Image:
-    """左下または右下へ URL 帯と QR を上書きする。
+    """URL 帯を左下または右下へ、QR を元画像の右下へ上書きする。
 
     帯が画像幅を超えるときだけ、はみ出した側を透明にして広げる。
+    QR は left / right に関わらず元画像の右端に置き、拡張した余白には出さない。
     """
     src = source.convert("RGBA")
     text = render_text(url, font, config.URL_TEXT_COLOR)
@@ -163,15 +164,15 @@ def compose(
         canvas.paste(src, (image_x, 0), src)
     else:
         canvas = src.copy()
+        image_x = 0
 
     if side == "left":
         bar_x = 0
-        qr_x = 0
     else:
         bar_x = canvas.width - bar_width
-        qr_x = canvas.width - qr_image.width
 
     bar_y = canvas.height - bar_height
+    qr_x = image_x + src.width - qr_image.width
     qr_y = bar_y - qr_image.height
 
     paste_clipped(canvas, qr_image, qr_x, qr_y)
