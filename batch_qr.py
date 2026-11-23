@@ -1,4 +1,7 @@
-"""list.csv の画像へ URL 帯と QR コードを重ね、dist へ書き出す。"""
+"""list.csv の指定で URL 帯と QR コードを dist へ書き出す。
+
+画像ありの行は img の画像へ重ねる。画像なしの行は帯と QR だけを出力する。
+"""
 
 from __future__ import annotations
 
@@ -190,6 +193,50 @@ def compose(
     return canvas
 
 
+def compose_plain(
+    url: str,
+    side: str,
+    font: ImageFont.FreeTypeFont,
+) -> Image.Image:
+    """元画像なしで URL 帯と QR を描く。
+
+    left は両方を左へ、right は両方を右へ寄せる。
+    幅の差で空いた部分は透明のままにする。
+    """
+    text = render_text(url, font, config.URL_TEXT_COLOR)
+    bar_width = text.width + config.URL_PADDING_X * 2
+    bar_height = config.URL_BAR_HEIGHT
+    qr_image = make_qr(url)
+
+    width = max(bar_width, qr_image.width)
+    height = qr_image.height + bar_height
+    canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+
+    if side == "left":
+        bar_x = 0
+        qr_x = 0
+    else:
+        bar_x = width - bar_width
+        qr_x = width - qr_image.width
+
+    bar_y = height - bar_height
+    qr_y = 0
+
+    paste_clipped(canvas, qr_image, qr_x, qr_y)
+    bar = Image.new("RGBA", (bar_width, bar_height), ImageColor.getrgb(config.URL_BG_COLOR) + (255,))
+    canvas.paste(bar, (bar_x, bar_y))
+    text_x = bar_x + config.URL_PADDING_X
+    text_y = bar_y + (bar_height - text.height) // 2
+    paste_clipped(
+        canvas,
+        text,
+        text_x,
+        text_y,
+        (bar_x, bar_y, bar_x + bar_width, bar_y + bar_height),
+    )
+    return canvas
+
+
 def valid_filename(name: str) -> bool:
     if not name or name in {".", ".."}:
         return False
@@ -213,14 +260,22 @@ def process_row(
     dist_dir: Path,
 ) -> bool:
     """1行を処理する。成功かスキップなら True、失敗なら False。"""
-    if len(row) != 3:
+    if len(row) != 4:
         print(
-            f"行 {line_no}: 列はファイル名,URL,配置の3つです",
+            f"行 {line_no}: 列は画像の有無,名前,URL,配置の4つです",
             file=sys.stderr,
         )
         return False
 
-    filename, url, side = (cell.strip() for cell in row)
+    has_image_text, filename, url, side = (cell.strip() for cell in row)
+    has_image_key = has_image_text.lower()
+    if has_image_key not in {"true", "false"}:
+        print(
+            f"行 {line_no}: 画像の有無は true か false です: {has_image_text}",
+            file=sys.stderr,
+        )
+        return False
+    has_image = has_image_key == "true"
     if not valid_filename(filename):
         print(f"行 {line_no}: ファイル名にパスは使えません: {filename}", file=sys.stderr)
         return False
@@ -231,17 +286,24 @@ def process_row(
         print(f"行 {line_no}: 配置は left か right です: {side}", file=sys.stderr)
         return False
 
-    source_path = img_dir / filename
+    if not has_image and not Path(filename).suffix:
+        filename = f"{filename}.png"
+
     dest_path = dist_dir / filename
     if dest_path.exists():
         print(f"スキップ: {dest_path.name} は既にあるため上書きしません")
         return True
-    if not source_path.is_file():
-        print(f"行 {line_no}: 画像がありません: {source_path}", file=sys.stderr)
-        return False
 
-    with Image.open(source_path) as source:
-        result = compose(source, url, side, font)
+    if has_image:
+        source_path = img_dir / filename
+        if not source_path.is_file():
+            print(f"行 {line_no}: 画像がありません: {source_path}", file=sys.stderr)
+            return False
+        with Image.open(source_path) as source:
+            result = compose(source, url, side, font)
+    else:
+        result = compose_plain(url, side, font)
+
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     result.save(dest_path, "PNG")
     print(f"保存: {dest_path.name} ({result.width}x{result.height})")
